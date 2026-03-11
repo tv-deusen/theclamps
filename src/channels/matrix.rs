@@ -1,5 +1,6 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use std::collections::HashMap;
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
@@ -7,7 +8,7 @@ use matrix_sdk::{
         events::reaction::ReactionEventContent,
         events::relation::{Annotation, InReplyTo, Thread},
         events::room::message::{
-            MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+            MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
         },
         events::room::MediaSource,
         OwnedEventId, OwnedRoomId, OwnedUserId,
@@ -36,6 +37,7 @@ pub struct MatrixChannel {
     sdk_client: Arc<OnceCell<MatrixSdkClient>>,
     http_client: Client,
     reaction_events: Arc<RwLock<HashMap<String, String>>>,
+    voice_mode: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -169,6 +171,7 @@ impl MatrixChannel {
             sdk_client: Arc::new(OnceCell::new()),
             http_client: Client::new(),
             reaction_events: Arc::new(RwLock::new(HashMap::new())),
+            voice_mode: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -536,7 +539,11 @@ impl Channel for MatrixChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let client = self.matrix_client().await?;
-        let target_room_id = self.target_room_id().await?;
+        let target_room_id = if message.recipient.contains("||") {
+            message.recipient.splitn(2, "||").nth(1).unwrap().to_string()
+        } else {
+            self.target_room_id().await?
+        };
         let target_room: OwnedRoomId = target_room_id.parse()?;
 
         let mut room = client.get_room(&target_room);
@@ -565,6 +572,70 @@ impl Channel for MatrixChannel {
         }
 
         room.send(content).await?;
+
+        // Voice reply: generate TTS audio and send as m.audio when voice_mode is active
+        if self.voice_mode.load(Ordering::Relaxed) {
+            self.voice_mode.store(false, Ordering::Relaxed);
+            tracing::info!("Voice mode active, generating TTS reply");
+            let voice_work = std::path::PathBuf::from("/tmp/zeroclaw-voice");
+            let _ = tokio::fs::create_dir_all(&voice_work).await;
+            let mp3_path = voice_work.join("reply.mp3");
+
+            let tts_text = message.content
+                .replace("**", "").replace("*", "")
+                .replace("`", "").replace("# ", "");
+
+            let tts_ok = tokio::process::Command::new("edge-tts")
+                .arg("--text").arg(&tts_text)
+                .arg("--write-media").arg(&mp3_path)
+                .output().await
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            if tts_ok && mp3_path.exists() {
+                if let Ok(audio_data) = tokio::fs::read(&mp3_path).await {
+                    let upload_url = format!(
+                        "{}/_matrix/media/v3/upload?filename=voice-reply.mp3",
+                        self.homeserver
+                    );
+                    if let Ok(resp) = self.http_client
+                        .post(&upload_url)
+                        .header("Authorization", self.auth_header_value())
+                        .header("Content-Type", "audio/mpeg")
+                        .body(audio_data)
+                        .send().await
+                    {
+                        if resp.status().is_success() {
+                            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                                if let Some(content_uri) = body["content_uri"].as_str() {
+                                    let encoded_room = Self::encode_path_segment(&target_room_id);
+                                    let txn_id = format!("voice_{}",
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default().as_millis()
+                                    );
+                                    let audio_msg = serde_json::json!({
+                                        "msgtype": "m.audio",
+                                        "body": "Voice reply",
+                                        "url": content_uri,
+                                        "info": { "mimetype": "audio/mpeg" }
+                                    });
+                                    let send_url = format!(
+                                        "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+                                        self.homeserver, encoded_room, txn_id
+                                    );
+                                    let _ = self.http_client
+                                        .put(&send_url)
+                                        .header("Authorization", self.auth_header_value())
+                                        .json(&audio_msg)
+                                        .send().await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -609,6 +680,9 @@ impl Channel for MatrixChannel {
         let my_user_id_for_handler = my_user_id.clone();
         let allowed_users_for_handler = self.allowed_users.clone();
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
+        let homeserver_for_handler = self.homeserver.clone();
+        let access_token_for_handler = self.access_token.clone();
+        let voice_mode_for_handler = Arc::clone(&self.voice_mode);
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -616,9 +690,12 @@ impl Channel for MatrixChannel {
             let my_user_id = my_user_id_for_handler.clone();
             let allowed_users = allowed_users_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
+            let homeserver = homeserver_for_handler.clone();
+            let access_token = access_token_for_handler.clone();
+            let voice_mode = Arc::clone(&voice_mode_for_handler);
 
             async move {
-                if room.room_id().as_str() != target_room.as_str() {
+                if false /* multi-room: room_id filter disabled */ {
                     return;
                 }
 
@@ -631,10 +708,109 @@ impl Channel for MatrixChannel {
                     return;
                 }
 
-                let body = match &event.content.msgtype {
-                    MessageType::Text(content) => content.body.clone(),
-                    MessageType::Notice(content) => content.body.clone(),
+                // Helper: extract mxc:// download URL and filename for media types
+                let media_info = |source: &MediaSource, name: &str| -> Option<(String, String)> {
+                    match source {
+                        MediaSource::Plain(mxc) => {
+                            let rest = mxc.as_str().strip_prefix("mxc://")?;
+                            let url = format!(
+                                "{}/_matrix/client/v1/media/download/{}",
+                                homeserver, rest
+                            );
+                            Some((url, name.to_string()))
+                        }
+                        _ => None,
+                    }
+                };
+
+                let (body, media_download) = match &event.content.msgtype {
+                    MessageType::Text(content) => (content.body.clone(), None),
+                    MessageType::Notice(content) => (content.body.clone(), None),
+                    MessageType::Image(content) => {
+                        let dl = media_info(&content.source, &content.body);
+                        (format!("[image: {}]", content.body), dl)
+                    }
+                    MessageType::File(content) => {
+                        let dl = media_info(&content.source, &content.body);
+                        (format!("[file: {}]", content.body), dl)
+                    }
+                    MessageType::Audio(content) => {
+                        let dl = media_info(&content.source, &content.body);
+                        (format!("[audio: {}]", content.body), dl)
+                    }
+                    MessageType::Video(content) => {
+                        let dl = media_info(&content.source, &content.body);
+                        (format!("[video: {}]", content.body), dl)
+                    }
                     _ => return,
+                };
+
+                // Download media to workspace if present
+                let body = if let Some((url, filename)) = media_download {
+                    let workspace = std::path::PathBuf::from(
+                        std::env::var("ZEROCLAW_WORKSPACE").unwrap_or_else(|_| "/tmp/zeroclaw-uploads".to_string())
+                    );
+                    let _ = tokio::fs::create_dir_all(&workspace).await;
+                    let dest = workspace.join(&filename);
+                    let client = reqwest::Client::new();
+                    match client.get(&url)
+                        .header("Authorization", format!("Bearer {}", access_token))
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.bytes().await {
+                                Ok(bytes) => {
+                                    match tokio::fs::write(&dest, &bytes).await {
+                                        Ok(_) => format!("{} — saved to {}", body, dest.display()),
+                                        Err(_) => format!("{} — failed to write to disk", body),
+                                    }
+                                }
+                                Err(_) => format!("{} — download failed", body),
+                            }
+                        }
+                        _ => format!("{} — download failed (auth error?)", body),
+                    }
+                } else {
+                    body
+                };
+
+                // Voice transcription: if this was an audio message, transcribe it
+                let body = if body.starts_with("[audio:") {
+                    if let Some(path_start) = body.find("saved to ") {
+                        let audio_path = body[path_start + 9..].to_string();
+                        let wav_path = format!("{}.16k.wav", audio_path);
+                        let convert_ok = tokio::process::Command::new("ffmpeg")
+                            .args(["-y", "-i", &audio_path, "-ar", "16000", "-ac", "1", "-f", "wav", &wav_path])
+                            .stderr(std::process::Stdio::null())
+                            .output()
+                            .await
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
+                        if convert_ok {
+                            let transcription = tokio::process::Command::new("whisper-cpp")
+                                .args(["-m", "/tmp/ggml-base.en.bin",
+                                       "-f", &wav_path, "--no-timestamps", "-nt"])
+                                .output()
+                                .await
+                                .ok()
+                                .filter(|o| o.status.success())
+                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                                .filter(|s| !s.is_empty());
+                            if let Some(text) = transcription {
+                                voice_mode.store(true, Ordering::Relaxed);
+                                format!("[Voice message]: {}", text)
+                            } else {
+                                body
+                            }
+                        } else {
+                            body
+                        }
+                    } else {
+                        body
+                    }
+                } else {
+                    body
                 };
 
                 if !MatrixChannel::has_non_empty_body(&body) {
@@ -657,9 +833,9 @@ impl Channel for MatrixChannel {
                 let msg = ChannelMessage {
                     id: event_id,
                     sender: sender.clone(),
-                    reply_target: sender,
+                    reply_target: format!("{}||{}", sender, room.room_id()),
                     content: body,
-                    channel: "matrix".to_string(),
+                    channel: format!("matrix:{}", room.room_id()),
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -758,6 +934,130 @@ impl Channel for MatrixChannel {
                 .map_err(|_| anyhow::anyhow!("Invalid reaction event ID: {}", reaction_event_id))?;
 
             room.redact(&event_id, None, None).await?;
+        }
+
+        Ok(())
+    }
+
+
+    async fn pin_message(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+    ) -> anyhow::Result<()> {
+        let room_id = self.target_room_id().await?;
+        let encoded_room = Self::encode_path_segment(&room_id);
+
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.pinned_events",
+            self.homeserver, encoded_room
+        );
+        let resp = self
+            .http_client
+            .get(&url)
+            .header("Authorization", self.auth_header_value())
+            .send()
+            .await?;
+
+        let mut pinned: Vec<String> = if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            body.get("pinned")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let msg_id = message_id.to_string();
+        if pinned.contains(&msg_id) {
+            return Ok(());
+        }
+        pinned.push(msg_id);
+
+        let put_url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.pinned_events",
+            self.homeserver, encoded_room
+        );
+        let body = serde_json::json!({ "pinned": pinned });
+        let resp = self
+            .http_client
+            .put(&put_url)
+            .header("Authorization", self.auth_header_value())
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix pin_message failed: {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn unpin_message(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+    ) -> anyhow::Result<()> {
+        let room_id = self.target_room_id().await?;
+        let encoded_room = Self::encode_path_segment(&room_id);
+
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.pinned_events",
+            self.homeserver, encoded_room
+        );
+        let resp = self
+            .http_client
+            .get(&url)
+            .header("Authorization", self.auth_header_value())
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Ok(());
+        }
+
+        let body: serde_json::Value = resp.json().await?;
+        let mut pinned: Vec<String> = body
+            .get("pinned")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let msg_id = message_id.to_string();
+        let original_len = pinned.len();
+        pinned.retain(|id| id != &msg_id);
+
+        if pinned.len() == original_len {
+            return Ok(());
+        }
+
+        let put_url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.pinned_events",
+            self.homeserver, encoded_room
+        );
+        let body = serde_json::json!({ "pinned": pinned });
+        let resp = self
+            .http_client
+            .put(&put_url)
+            .header("Authorization", self.auth_header_value())
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix unpin_message failed: {err}");
         }
 
         Ok(())
